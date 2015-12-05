@@ -1,2 +1,4 @@
 /content/themes/
 .idea/
+
+node_modules

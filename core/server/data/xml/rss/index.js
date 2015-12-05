@@ -1,67 +1,58 @@
 var _        = require('lodash'),
-    Promise  = require('bluebird'),
     cheerio  = require('cheerio'),
     crypto   = require('crypto'),
     downsize = require('downsize'),
     RSS      = require('rss'),
     url      = require('url'),
     config   = require('../../../config'),
-    api      = require('../../../api'),
     filters  = require('../../../filters'),
+
+    // Really ugly temporary hack for location of things
+    fetchData = require('../../../controllers/frontend/fetch-data'),
 
     generate,
     generateFeed,
     getFeedXml,
     feedCache = {};
 
-function isPaginated(req) {
-    return req.route.path.indexOf(':page') !== -1;
-}
-
 function isTag(req) {
-    return req.route.path.indexOf('/' + config.routeKeywords.tag + '/') !== -1;
+    return req.originalUrl.indexOf('/' + config.routeKeywords.tag + '/') !== -1;
 }
 
 function isAuthor(req) {
-    return req.route.path.indexOf('/' + config.routeKeywords.author + '/') !== -1;
+    return req.originalUrl.indexOf('/' + config.routeKeywords.author + '/') !== -1;
 }
 
 function handleError(next) {
-    return function (err) {
+    return function handleError(err) {
         return next(err);
     };
 }
 
-function getOptions(req, pageParam, slugParam) {
-    var options = {};
-
-    if (pageParam) { options.page = pageParam; }
-    if (isTag(req)) { options.tag = slugParam; }
-    if (isAuthor(req)) { options.author = slugParam; }
-
-    options.include = 'author,tags,fields';
-
-    return options;
-}
-
-function getData(options) {
-    var ops = {
-        title: api.settings.read('title'),
-        description: api.settings.read('description'),
-        permalinks: api.settings.read('permalinks'),
-        results: api.posts.browse(options)
+function getData(channelOpts, slugParam) {
+    channelOpts.data = channelOpts.data || {};
+    channelOpts.data.permalinks = {
+        type: 'read',
+        resource: 'settings',
+        options: 'permalinks'
     };
 
-    return Promise.props(ops).then(function (result) {
-        var titleStart = options.tags ? result.results.meta.filters.tags[0].name + ' - ' :
-                options.author ? result.results.meta.filters.author.name + ' - ' : '';
+    return fetchData(channelOpts, slugParam).then(function (result) {
+        var response = {},
+            titleStart = '';
 
-        return {
-            title: titleStart + result.title.settings[0].value,
-            description: result.description.settings[0].value,
-            permalinks: result.permalinks.settings[0],
-            results: result.results
+        if (result.data.tag) { titleStart = result.data.tag[0].name + ' - ' || ''; }
+        if (result.data.author) { titleStart = result.data.author[0].name + ' - ' || ''; }
+
+        response.title = titleStart + config.theme.title;
+        response.description = config.theme.description;
+        response.permalinks = result.data.permalinks[0];
+        response.results = {
+            posts: result.posts,
+            meta: result.meta
         };
+
+        return response;
     });
 }
 
@@ -82,8 +73,8 @@ function getBaseUrl(req, slugParam) {
 function processUrls(html, siteUrl, itemUrl) {
     var htmlContent = cheerio.load(html, {decodeEntities: false});
     // convert relative resource urls to absolute
-    ['href', 'src'].forEach(function (attributeName) {
-        htmlContent('[' + attributeName + ']').each(function (ix, el) {
+    ['href', 'src'].forEach(function forEach(attributeName) {
+        htmlContent('[' + attributeName + ']').each(function each(ix, el) {
             var baseUrl,
                 attributeValue,
                 parsed;
@@ -99,6 +90,11 @@ function processUrls(html, siteUrl, itemUrl) {
                 if (parsed.protocol) {
                     return;
                 }
+
+                // Do not convert protocol relative URLs
+                if (attributeValue.lastIndexOf('//', 0) === 0) {
+                    return;
+                }
             } catch (e) {
                 return;
             }
@@ -108,18 +104,7 @@ function processUrls(html, siteUrl, itemUrl) {
             // if the relative URL begins with a '/' use the blog URL (including sub-directory)
             // as the base URL, otherwise use the post's URL.
             baseUrl = attributeValue[0] === '/' ? siteUrl : itemUrl;
-
-            // prevent double subdirectories
-            if (attributeValue.indexOf(config.paths.subdir) === 0) {
-                attributeValue = attributeValue.replace(config.paths.subdir, '');
-            }
-
-            // prevent double slashes
-            if (baseUrl.slice(-1) === '/' && attributeValue[0] === '/') {
-                attributeValue = attributeValue.substr(1);
-            }
-
-            attributeValue = baseUrl + attributeValue;
+            attributeValue = config.urlJoin(baseUrl, attributeValue);
             el.attr(attributeName, attributeValue);
         });
     });
@@ -127,7 +112,7 @@ function processUrls(html, siteUrl, itemUrl) {
     return htmlContent;
 }
 
-getFeedXml = function (path, data) {
+getFeedXml = function getFeedXml(path, data) {
     var dataHash = crypto.createHash('md5').update(JSON.stringify(data)).digest('hex');
     if (!feedCache[path] || feedCache[path].hash !== dataHash) {
         // We need to regenerate
@@ -140,7 +125,7 @@ getFeedXml = function (path, data) {
     return feedCache[path].xml;
 };
 
-generateFeed = function (data) {
+generateFeed = function generateFeed(data) {
     var feed = new RSS({
         title: data.title,
         description: data.description,
@@ -154,7 +139,7 @@ generateFeed = function (data) {
         }
     });
 
-    data.results.posts.forEach(function (post) {
+    data.results.posts.forEach(function forEach(post) {
         var itemUrl = config.urlFor('post', {post: post, permalinks: data.permalinks, secure: data.secure}, true),
             htmlContent = processUrls(post.html, data.siteUrl, itemUrl),
             item = {
@@ -193,27 +178,33 @@ generateFeed = function (data) {
             }
         });
 
-        feed.item(item);
+        filters.doFilter('rss.item', item, post).then(function then(item) {
+            feed.item(item);
+        });
     });
 
-    return filters.doFilter('rss.feed', feed).then(function (feed) {
+    return filters.doFilter('rss.feed', feed).then(function then(feed) {
         return feed.xml();
     });
 };
 
-generate = function (req, res, next) {
+generate = function generate(req, res, next) {
     // Initialize RSS
     var pageParam = req.params.page !== undefined ? parseInt(req.params.page, 10) : 1,
         slugParam = req.params.slug,
-        baseUrl   = getBaseUrl(req, slugParam),
-        options   = getOptions(req, pageParam, slugParam);
+        baseUrl   = getBaseUrl(req, slugParam);
+
+    // Ensure we at least have an empty object for postOptions
+    req.channelConfig.postOptions = req.channelConfig.postOptions || {};
+    // Set page on postOptions for the query made later
+    req.channelConfig.postOptions.page = pageParam;
 
     // No negative pages, or page 1
-    if (isNaN(pageParam) || pageParam < 1 || (pageParam === 1 && isPaginated(req))) {
+    if (isNaN(pageParam) || pageParam < 1 || (req.params.page !== undefined && pageParam === 1)) {
         return res.redirect(baseUrl);
     }
 
-    return getData(options).then(function (data) {
+    return getData(req.channelConfig, slugParam).then(function then(data) {
         var maxPage = data.results.meta.pagination.pages;
 
         // If page is greater than number of pages we have, redirect to last page
@@ -226,7 +217,7 @@ generate = function (req, res, next) {
         data.feedUrl = config.urlFor({relativeUrl: baseUrl, secure: req.secure}, true);
         data.secure = req.secure;
 
-        return getFeedXml(req.route.path, data).then(function (feedXml) {
+        return getFeedXml(req.originalUrl, data).then(function then(feedXml) {
             res.set('Content-Type', 'text/xml; charset=UTF-8');
             res.send(feedXml);
         });
